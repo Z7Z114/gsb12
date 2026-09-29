@@ -92,17 +92,66 @@ E2. 邮件：未配置 SMTP 时允许 mock 并标记已发送；SMTP 已配置�
 F1. 会议状态只能按 `pending -> transcribed -> summarized/completed` 单调推进；
 处理失败时不得把状态更新为已完成。
 
-## 已知问题（现象，仅列出一部分）
-
-- 上传名为 `../../evil.wav` 的文件时，文件会写到上传目录之外；
-- 同一段音频处理两次会产生两条转写记录；
-- 用一个会议的 `audio_file_id` 去处理另一个会议，接口照样成功；
-- 给不存在的会议写田野笔记会返回 200 而不是 404；
-- 时间线的 `end_time` 小于 `start_time` 也能保存；
-- 真实 Whisper / pyannote / OpenAI 调用失败后，页面仍显示成功、库里存的是 mock 内容。
-
-注意：「已知问题」只是现象清单的一部分，验收以「行为规格」为准，不要只修这里列出的现象。
-
 ## 变更说明
 
-（由修复者填写：逐条写清每个问题的根因与修法。）
+以下按「行为规格」逐条说明根因与修法，对应测试见 `backend/tests/test_behavior_spec.py`。
+
+### A. 输入校验
+
+- **A1 会议标题**：`MeetingCreate.title` 原无任何校验，空串/纯空白也能落库。
+  修法：在 `models/schemas.py` 的 `MeetingBase` 上加 `field_validator`，
+  空白标题抛 `ValueError`，FastAPI 自动返回 422。
+- **A2 片段时间**：`TimelineClipBase` 原未校验 `start_time`/`end_time`，
+  负数起点、`end_time <= start_time` 都能保存。修法：在 `TimelineClipBase` 上加
+  `start_time >= 0` 的字段校验和 `end_time > start_time` 的 `model_validator`，
+  建时间线与追加片段两个入口同时生效，非法输入返回 422 且不落库。
+
+### B. 资源存在性与归属
+
+- **B1 孤儿记录**：`POST /meetings/{id}/field-notes`、`POST /meetings/{id}/timelines`
+  的函数签名根本没接收路径里的 `meeting_id`，直接按请求体落库，会议不存在也返回 200。
+  修法：两个端点补上路径参数，先查会议、不存在返回 404。
+- **B2 归属不一致**：田野笔记/时间线/片段的请求体 id 与路径 id 不一致时会被静默采信。
+  修法：三个端点一律以路径 id 为准，请求体 id 与路径不一致返回 400，
+  落库记录强制使用路径值。
+- **B3 片段挂到不存在的时间线**：`POST /timelines/{timeline_id}/clips` 同样丢弃了
+  路径参数，可往任意 `timeline_id` 写孤儿片段。修法：先校验时间线存在（否则 404），
+  请求体 `timeline_id` 与路径不一致返回 400。
+
+### C. 音频上传
+
+- **C1 路径逃逸**：原实现把 `file.filename` 直接拼进落盘路径，`../../evil.wav`
+  会写到上传目录之外。修法：新增 `_safe_upload_path()`——先做 `\`→`/` 归一化再取
+  `basename` 去掉路径成分、折叠 `..`，加 UUID 前缀后用 `realpath` 校验最终路径
+  必须位于上传目录内；数据库 `filename` 字段仍保留原始文件名（含中文）用于展示。
+- **C2 同名覆盖**：原落盘名是固定的 `meeting_{id}_{filename}`，同名重复上传互相覆盖。
+  修法：落盘文件名加 UUID 唯一前缀，两次上传 `file_path` 不同且文件都真实存在。
+
+### D. 音频处理
+
+- **D1 重复转写**：`process-audio` 每次都新建 `Transcript`。修法：处理前按
+  `audio_file_id` 查既有转写，存在则直接返回既有 `transcript_id`，不重复插入。
+- **D2 跨会议引用**：原实现只按 `audio_file_id` 查文件、不校验归属，能把 A 会议的
+  音频转写挂到 B 会议。修法：显式校验 `audio_file.meeting_id == request.meeting_id`，
+  不一致返回 400。
+- **D3 失败伪装成功**：`speaker_diarization` / `transcription` 在真实模型已加载、
+  推理失败时 `except` 里回落 `_mock_*`，把 mock 文本当真实结果落库。修法：真实调用
+  失败改为抛 `RuntimeError`；端点捕获后回滚事务并返回 502，不落库、不推进状态。
+  mock 分支只保留给「依赖未安装/未配置」的离线场景。
+
+### E. 外部服务失败处理
+
+- **E1 AI 摘要**：`ai_summary_service` 在 OpenAI 调用失败、或返回内容不是合法 JSON 时
+  回落 `_mock_summary` 并落库。修法：两种情况都改为抛错，`generate-summary` 与
+  `full-process` 捕获后回滚并返回 502，不写蒙太奇纪要、不推进状态；
+  仅未配置 `OPENAI_API_KEY` 时走 mock。
+- **E2 邮件**：原实现已区分「未配置 SMTP 走 mock」与「发送失败返回 False」，
+  保持该行为；补充测试确认 SMTP 已配置但发送失败时响应 `success=false`
+  且 `email_sent` 保持 false。
+
+### F. 会议状态
+
+- **F1 状态机**：原实现在各处直接赋值 `meeting.status`，处理失败也会把会议推进为
+  `transcribed`/`summarized`/`completed`。修法：新增 `_advance_meeting_status()`，
+  只允许 `pending -> transcribed -> summarized/completed` 单调推进；
+  所有处理路径先做事务回滚再返回错误，失败时状态原地不动。

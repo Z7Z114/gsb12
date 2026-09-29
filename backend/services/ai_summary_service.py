@@ -91,14 +91,14 @@ class AISummaryService:
                     raise ValueError("Result is not a dictionary")
             except (json.JSONDecodeError, ValueError) as e:
                 logger.error(f"Failed to parse AI response as JSON: {e}")
-                result = self._mock_summary(segments, field_notes)
+                raise RuntimeError(f"AI 摘要返回内容无法解析为 JSON: {e}") from e
 
             logger.info("Successfully generated montage summary")
             return result
 
         except Exception as e:
             logger.error(f"AI summary generation failed: {e}")
-            return self._mock_summary(segments, field_notes)
+            raise RuntimeError(f"AI 摘要生成失败: {e}") from e
 
     def _mock_summary(
         self,

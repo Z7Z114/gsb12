@@ -48,7 +48,7 @@ class WhisperTranscriptionService:
 
         except Exception as e:
             logger.error(f"Transcription failed: {e}")
-            return self._mock_transcribe(audio_path)
+            raise RuntimeError(f"音频转写失败: {e}") from e
 
     def _mock_transcribe(self, audio_path: str) -> Dict[str, Any]:
         mock_segments = [

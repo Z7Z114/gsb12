@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
+import re
+import uuid
 import shutil
 import json
 
@@ -27,6 +29,26 @@ UPLOAD_DIR = settings.UPLOAD_DIR
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 processor = MeetingProcessor()
+
+# 会议状态机：只允许 pending -> transcribed -> summarized/completed 单调推进
+_STATUS_ORDER = {"pending": 0, "transcribed": 1, "summarized": 2, "completed": 2}
+
+
+def _advance_meeting_status(meeting: models.Meeting, new_status: str) -> None:
+    current = _STATUS_ORDER.get(meeting.status or "pending", 0)
+    if _STATUS_ORDER[new_status] > current:
+        meeting.status = new_status
+
+
+def _safe_upload_path(filename: Optional[str]) -> str:
+    """把原始文件名安全化为落盘路径：去掉路径成分、加唯一前缀，保证落在 UPLOAD_DIR 内。"""
+    base = os.path.basename((filename or "").replace("\\", "/")).strip()
+    base = re.sub(r"\.\.+", ".", base).strip(". ") or "audio"
+    upload_root = os.path.realpath(UPLOAD_DIR)
+    candidate = os.path.realpath(os.path.join(upload_root, f"{uuid.uuid4().hex}_{base}"))
+    if os.path.dirname(candidate) != upload_root:
+        raise HTTPException(status_code=400, detail="非法的文件名")
+    return candidate
 
 
 @router.get("/meetings", response_model=List[MeetingResponse])
@@ -63,7 +85,7 @@ async def upload_audio(
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
 
-    file_location = os.path.join(UPLOAD_DIR, f"meeting_{meeting_id}_{file.filename}")
+    file_location = _safe_upload_path(file.filename)
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -99,6 +121,11 @@ def process_audio(request: ProcessAudioRequest, db: Session = Depends(get_db)):
         audio_file = db.query(models.AudioFile).filter(
             models.AudioFile.id == request.audio_file_id
         ).first()
+        if audio_file and audio_file.meeting_id != request.meeting_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Audio file does not belong to this meeting"
+            )
     else:
         audio_file = db.query(models.AudioFile).filter(
             models.AudioFile.meeting_id == request.meeting_id
@@ -107,7 +134,22 @@ def process_audio(request: ProcessAudioRequest, db: Session = Depends(get_db)):
     if not audio_file:
         raise HTTPException(status_code=404, detail="Audio file not found")
 
-    result = processor.process_audio_file(audio_file.file_path)
+    # 幂等：同一音频文件已转写过则直接复用既有结果，不重复插入
+    existing = db.query(models.Transcript).filter(
+        models.Transcript.audio_file_id == audio_file.id
+    ).first()
+    if existing:
+        return ProcessResult(
+            success=True,
+            message="该音频已处理过，返回既有转写结果",
+            data={"transcript_id": existing.id}
+        )
+
+    try:
+        result = processor.process_audio_file(audio_file.file_path)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"音频处理失败: {e}")
 
     transcript = models.Transcript(
         meeting_id=request.meeting_id,
@@ -128,7 +170,7 @@ def process_audio(request: ProcessAudioRequest, db: Session = Depends(get_db)):
         )
         db.add(segment)
 
-    meeting.status = "transcribed"
+    _advance_meeting_status(meeting, "transcribed")
     db.commit()
     db.refresh(transcript)
 
@@ -156,7 +198,15 @@ def get_transcript(transcript_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/meetings/{meeting_id}/field-notes", response_model=FieldNoteResponse)
-def create_field_note(note: FieldNoteCreate, db: Session = Depends(get_db)):
+def create_field_note(meeting_id: int, note: FieldNoteCreate, db: Session = Depends(get_db)):
+    meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if note.meeting_id != meeting_id:
+        raise HTTPException(
+            status_code=400,
+            detail="请求体中的 meeting_id 与路径不一致"
+        )
     db_note = models.FieldNote(**note.model_dump())
     db.add(db_note)
     db.commit()
@@ -173,9 +223,17 @@ def get_field_notes(meeting_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/meetings/{meeting_id}/timelines", response_model=TimelineResponse)
-def create_timeline(timeline: TimelineCreate, db: Session = Depends(get_db)):
+def create_timeline(meeting_id: int, timeline: TimelineCreate, db: Session = Depends(get_db)):
+    meeting = db.query(models.Meeting).filter(models.Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if timeline.meeting_id != meeting_id:
+        raise HTTPException(
+            status_code=400,
+            detail="请求体中的 meeting_id 与路径不一致"
+        )
     db_timeline = models.Timeline(
-        meeting_id=timeline.meeting_id,
+        meeting_id=meeting_id,
         title=timeline.title
     )
     db.add(db_timeline)
@@ -206,7 +264,15 @@ def get_timelines(meeting_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/timelines/{timeline_id}/clips", response_model=TimelineClipResponse)
-def add_timeline_clip(clip: TimelineClipCreate, db: Session = Depends(get_db)):
+def add_timeline_clip(timeline_id: int, clip: TimelineClipCreate, db: Session = Depends(get_db)):
+    timeline = db.query(models.Timeline).filter(models.Timeline.id == timeline_id).first()
+    if not timeline:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    if clip.timeline_id != timeline_id:
+        raise HTTPException(
+            status_code=400,
+            detail="请求体中的 timeline_id 与路径不一致"
+        )
     db_clip = models.TimelineClip(**clip.model_dump())
     db.add(db_clip)
     db.commit()
@@ -246,7 +312,11 @@ def generate_summary(request: ProcessMeetingRequest, db: Session = Depends(get_d
     ).all()
     field_note_contents = [note.content for note in field_notes]
 
-    summary = processor.generate_montage_summary(all_segments, field_note_contents)
+    try:
+        summary = processor.generate_montage_summary(all_segments, field_note_contents)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"AI 摘要生成失败: {e}")
 
     edit_decisions_json = json.dumps(summary.get("edit_decisions", []), ensure_ascii=False)
     subtitle_notes_json = json.dumps(summary.get("subtitle_notes", {}), ensure_ascii=False)
@@ -259,7 +329,7 @@ def generate_summary(request: ProcessMeetingRequest, db: Session = Depends(get_d
     )
     db.add(montage_note)
 
-    meeting.status = "summarized"
+    _advance_meeting_status(meeting, "summarized")
     db.commit()
     db.refresh(montage_note)
 
@@ -357,7 +427,11 @@ def full_process_meeting(request: ProcessMeetingRequest, db: Session = Depends(g
     ).first()
 
     if audio_file:
-        result = processor.process_audio_file(audio_file.file_path)
+        try:
+            result = processor.process_audio_file(audio_file.file_path)
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=502, detail=f"音频处理失败: {e}")
 
         transcript = models.Transcript(
             meeting_id=request.meeting_id,
@@ -401,7 +475,11 @@ def full_process_meeting(request: ProcessMeetingRequest, db: Session = Depends(g
     ).all()
     field_note_contents = [note.content for note in field_notes]
 
-    summary = processor.generate_montage_summary(all_segments, field_note_contents)
+    try:
+        summary = processor.generate_montage_summary(all_segments, field_note_contents)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"AI 摘要生成失败: {e}")
 
     edit_decisions_json = json.dumps(summary.get("edit_decisions", []), ensure_ascii=False)
     subtitle_notes_json = json.dumps(summary.get("subtitle_notes", {}), ensure_ascii=False)
@@ -414,7 +492,7 @@ def full_process_meeting(request: ProcessMeetingRequest, db: Session = Depends(g
     )
     db.add(montage_note)
 
-    meeting.status = "completed"
+    _advance_meeting_status(meeting, "completed")
     db.commit()
     db.refresh(montage_note)
 

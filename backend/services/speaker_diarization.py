@@ -58,7 +58,7 @@ class SpeakerDiarizationService:
 
         except Exception as e:
             logger.error(f"Speaker diarization failed: {e}")
-            return self._mock_diarize(audio_path)
+            raise RuntimeError(f"说话人识别失败: {e}") from e
 
     def _mock_diarize(self, audio_path: str) -> List[Dict[str, Any]]:
         mock_segments = [

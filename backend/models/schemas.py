@@ -1,11 +1,18 @@
 from datetime import datetime
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class MeetingBase(BaseModel):
     title: str
     description: Optional[str] = None
+
+    @field_validator("title")
+    @classmethod
+    def title_must_not_be_blank(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("title 必须是非空字符串")
+        return v
 
 
 class MeetingCreate(MeetingBase):
@@ -46,6 +53,19 @@ class TimelineClipBase(BaseModel):
     end_time: float
     source_file: Optional[str] = None
     notes: Optional[str] = None
+
+    @field_validator("start_time")
+    @classmethod
+    def start_time_must_be_non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("start_time 必须 >= 0")
+        return v
+
+    @model_validator(mode="after")
+    def end_time_must_be_after_start_time(self):
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time 必须大于 start_time")
+        return self
 
 
 class TimelineClipCreate(TimelineClipBase):
